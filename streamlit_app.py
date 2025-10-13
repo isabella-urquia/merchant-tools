@@ -56,6 +56,11 @@ def read_billing_zip(file) -> list[pd.DataFrame]:
 
 st.title("Dosespot Usage Upload")
 st.write("Upload billing files, IDP data, and the customers CSV to generate usage files.")
+st.link_button(
+    "Upload Usage",
+    "https://app.tabsplatform.com/merchant/usage/all?page=1&sort=uploadTime&sortDir=desc",
+    type="primary",
+)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -73,7 +78,14 @@ with col2:
 
 st.divider()
 
-if st.button("Generate Usage Files", type="primary"):
+generate_clicked = st.button("Generate Usage Files", type="primary")
+st.link_button(
+    "Upload Usage",
+    "https://app.tabsplatform.com/merchant/usage/all?page=1&sort=uploadTime&sortDir=desc",
+    type="primary",
+)
+
+if generate_clicked:
     if billing_zip is None or idp_file is None or customers_file is None:
         st.warning("Please upload all required files.")
     else:
@@ -93,30 +105,36 @@ if st.button("Generate Usage Files", type="primary"):
                 st.error(f"Failed to compute usage: {e}")
                 output_df = pd.DataFrame()
 
-            if output_df.empty:
-                st.info("No usage rows generated. Please verify inputs.")
-            else:
-                st.subheader("Preview")
-                st.dataframe(output_df.head(50), use_container_width=True)
+            # Save results in session to persist across reruns
+            st.session_state["usage_output_df"] = output_df
+            st.session_state["usage_filename_base"] = f"output-{selected_date.strftime('%Y%m%d')}"
+            # Precompute chunks for faster subsequent reruns
+            st.session_state["usage_chunks"] = chunk_csv_bytes(
+                output_df=output_df,
+                base_output_filename=st.session_state["usage_filename_base"],
+                chunk_size=500,
+            )
 
-                # Prepare chunked CSVs
-                chunks = chunk_csv_bytes(
-                    output_df=output_df,
-                    base_output_filename=f"output-{selected_date.strftime('%Y%m%d')}",
-                    chunk_size=500,
+# Render last generated results if available
+output_df_state = st.session_state.get("usage_output_df")
+if isinstance(output_df_state, pd.DataFrame):
+    if output_df_state.empty:
+        st.info("No usage rows generated. Please verify inputs.")
+    else:
+        st.subheader("Preview")
+        st.dataframe(output_df_state.head(50), width='stretch')
+
+        chunks_state = st.session_state.get("usage_chunks", [])
+        if chunks_state:
+            st.subheader("Downloads")
+            for fname, blob in chunks_state:
+                st.download_button(
+                    label=f"Download {fname}",
+                    data=blob,
+                    file_name=fname,
+                    mime="text/csv",
                 )
-
-                if chunks:
-                    st.subheader("Downloads")
-                    # Provide individual file downloads
-                    for fname, blob in chunks:
-                        st.download_button(
-                            label=f"Download {fname}",
-                            data=blob,
-                            file_name=fname,
-                            mime="text/csv",
-                        )
-                else:
-                    st.info("No non-empty chunks to download.")
+        else:
+            st.info("No non-empty chunks to download.")
 
 
