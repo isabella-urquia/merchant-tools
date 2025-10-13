@@ -55,7 +55,7 @@ def read_billing_zip(file) -> list[pd.DataFrame]:
 
 
 st.title("Dosespot Usage Upload")
-st.write("Upload a billing files, IDP data, and the customers CSV to generate usage files.")
+st.write("Upload billing files, IDP data, and the customers CSV to generate usage files.")
 
 col1, col2 = st.columns(2)
 with col1:
