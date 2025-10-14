@@ -56,11 +56,6 @@ def read_billing_zip(file) -> list[pd.DataFrame]:
 
 st.title("Dosespot Usage Upload")
 st.write("Upload billing files, IDP data, and the customers CSV to generate usage files.")
-st.link_button(
-    "Upload Usage",
-    "https://app.tabsplatform.com/merchant/usage/all?page=1&sort=uploadTime&sortDir=desc",
-    type="primary",
-)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -84,6 +79,7 @@ st.link_button(
     "https://app.tabsplatform.com/merchant/usage/all?page=1&sort=uploadTime&sortDir=desc",
     type="primary",
 )
+
 
 if generate_clicked:
     if billing_zip is None or idp_file is None or customers_file is None:
