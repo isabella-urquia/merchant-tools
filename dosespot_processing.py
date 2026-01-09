@@ -94,13 +94,32 @@ def compute_usage(
         all_customers_df["Included Prescribers"] = 10
 
     # IDP counts per clientid
-    idp_counts = (
-        idp_df.groupby("clientid")["clinicianid"].nunique().reset_index()
-        if not idp_df.empty
-        else pd.DataFrame(columns=["clientid", "clinicianid"])  # empty fallback
-    )
-    if not idp_counts.empty:
-        idp_counts.columns = ["clientid", "IDP"]
+    # Normalize IDP dataframe column names
+    if not idp_df.empty:
+        # Create normalized column map for IDP data
+        idp_normalized = {_normalize_column_name(c): c for c in idp_df.columns}
+        
+        # Find clientid column variant
+        clientid_col = None
+        for variant in ["clientid", "client_id", "clientidnumber", "clientnumber"]:
+            if variant in idp_normalized:
+                clientid_col = idp_normalized[variant]
+                break
+        
+        # Find clinicianid column variant
+        clinicianid_col = None
+        for variant in ["clinicianid", "clinician_id", "providerid", "provider_id", "doctorid"]:
+            if variant in idp_normalized:
+                clinicianid_col = idp_normalized[variant]
+                break
+        
+        if clientid_col and clinicianid_col:
+            idp_counts = idp_df.groupby(clientid_col)[clinicianid_col].nunique().reset_index()
+            idp_counts.columns = ["clientid", "IDP"]
+        else:
+            idp_counts = pd.DataFrame(columns=["clientid", "IDP"])
+    else:
+        idp_counts = pd.DataFrame(columns=["clientid", "IDP"])
 
     output_rows = []
 
