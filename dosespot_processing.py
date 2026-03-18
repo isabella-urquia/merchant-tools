@@ -75,7 +75,7 @@ def compute_usage(
 
     Returns a dataframe with columns:
       - customer_id
-      - event_type_name in {"Rx", "EPCS", "Non-EPCS", "Agents", "Free", "IDP"}
+      - event_type_name in {"Rx", "EPCS", "Non-EPCS", "Agents", "Free", "IDP", "MedHistory Reconciliation"}
       - datetime (string YYYY-MM-DD)
       - value (int)
       - differentiator (None)
@@ -141,6 +141,11 @@ def compute_usage(
 
         # Aggregate metrics from the billing file
         rx_sum = billing_df["Number of Prescriptions"].sum()
+        medhistory_recon_sum = (
+            billing_df["MedHistory Reconciliation Request Count"].sum()
+            if "MedHistory Reconciliation Request Count" in billing_df.columns
+            else 0
+        )
         epcs_count = billing_df[
             (billing_df["Role"] == "PrescribingClinician")
             & (billing_df["EPCS (enabled)"] == True)
@@ -239,6 +244,13 @@ def compute_usage(
                 "event_type_name": "IDP",
                 "datetime": date_str,
                 "value": int(idp_count),
+                "differentiator": None,
+            },
+            {
+                "customer_id": customer_id,
+                "event_type_name": "MedHistory Reconciliation",
+                "datetime": date_str,
+                "value": int(medhistory_recon_sum),
                 "differentiator": None,
             },
         ]
