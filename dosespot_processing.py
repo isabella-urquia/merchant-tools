@@ -398,6 +398,19 @@ def map_billing_files_to_customers(
                     "match_type": "fuzzy",
                     "match_score": round(score, 3),
                 })
+                continue
+
+        # --- no match ---
+        results.append({
+            "customer_id": None,
+            "client_id": client_id,
+            "client_name": client_name,
+            "tabs_customer_name": None,
+            "filename": filename,
+            "df": billing_df,
+            "match_type": "unmatched",
+            "match_score": 0.0,
+        })
 
     return results
 

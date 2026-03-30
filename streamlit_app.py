@@ -181,8 +181,13 @@ mapped_state = st.session_state.get("mapped_entries", [])
 if mapped_state:
     exact = [e for e in mapped_state if e.get("match_type") == "client_id"]
     fuzzy = [e for e in mapped_state if e.get("match_type") == "fuzzy"]
+    unmatched = [e for e in mapped_state if e.get("match_type") == "unmatched"]
 
-    st.markdown(f"**{len(exact)}** matched by Client ID, **{len(fuzzy)}** fuzzy-matched by name")
+    st.markdown(
+        f"**{len(exact)}** matched by Client ID, "
+        f"**{len(fuzzy)}** fuzzy-matched by name, "
+        f"**{len(unmatched)}** unmatched"
+    )
 
     if fuzzy:
         st.subheader("Fuzzy Matches — Review Before Attaching")
@@ -209,6 +214,17 @@ if mapped_state:
             use_container_width=True,
             key="fuzzy_review_editor",
         )
+
+    if unmatched:
+        with st.expander(f"Unmatched Files ({len(unmatched)})", expanded=False):
+            st.caption("These billing files could not be matched to any Tabs customer by Client ID or name.")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Client Name": e["client_name"], "Client ID": e["client_id"], "Filename": e["filename"]}
+                    for e in unmatched
+                ]),
+                use_container_width=True,
+            )
 
     # Step 2 — Run bulk attach
     attach_clicked = st.button("Bulk Attach to Invoices", type="primary")
@@ -237,10 +253,10 @@ if mapped_state:
             final_entries = [
                 e for e in mapped_state
                 if e["match_type"] == "client_id"
-                or e["filename"] in approved_fuzzy_filenames
+                or (e["match_type"] == "fuzzy" and e["filename"] in approved_fuzzy_filenames)
             ]
         else:
-            final_entries = mapped_state
+            final_entries = [e for e in mapped_state if e["match_type"] != "unmatched"]
 
         if not final_entries:
             st.warning("No billing files to attach.")
