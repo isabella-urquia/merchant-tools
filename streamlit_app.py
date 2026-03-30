@@ -143,19 +143,17 @@ st.divider()
 st.subheader("Bulk Attach Billing Files to Invoices")
 st.caption(
     "After generating usage, attach the original billing CSVs to matching "
-    "Tabs invoices. Requires a Tabs API URL and key."
+    "Tabs invoices."
 )
 
-with st.expander("Tabs API Connection", expanded=False):
-    tabs_url = st.text_input("Tabs Base URL", placeholder="https://api.tabsplatform.com")
-    tabs_key = st.text_input("Tabs API Key", type="password")
+tabs_url = "https://api.tabsplatform.com"
+tabs_key = st.text_input("Tabs API Key", type="password")
 
 billing_entries_state = st.session_state.get("billing_entries", [])
 customers_df_state = st.session_state.get("customers_df")
 
 attach_ready = (
-    bool(tabs_url)
-    and bool(tabs_key)
+    bool(tabs_key)
     and len(billing_entries_state) > 0
     and customers_df_state is not None
 )
