@@ -146,7 +146,7 @@ st.caption(
     "Tabs invoices."
 )
 
-tabs_url = "https://api.tabsplatform.com"
+tabs_url = "https://integrators.prod.api.tabsplatform.com"
 tabs_key = st.text_input("Tabs API Key", type="password")
 
 billing_entries_state = st.session_state.get("billing_entries", [])
