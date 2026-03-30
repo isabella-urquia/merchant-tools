@@ -1,6 +1,9 @@
-import pandas as pd
+import re
+from difflib import SequenceMatcher
 from io import BytesIO
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
+
+import pandas as pd
 
 
 def _normalize_column_name(name: str) -> str:
@@ -258,6 +261,145 @@ def compute_usage(
 
     output_df = pd.DataFrame([row for row in output_rows if row["value"] != 0])
     return output_df
+
+
+_STRIP_SUFFIXES = re.compile(
+    r"\b(llc|inc|ltd|corp|co|company|corporation|l\.?l\.?c|incorporated|dba)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip legal suffixes and non-alphanumeric chars for comparison."""
+    name = _STRIP_SUFFIXES.sub("", name.lower())
+    return re.sub(r"[^a-z0-9]", "", name)
+
+
+def _fuzzy_find_customer(
+    client_name: str,
+    customers_df: pd.DataFrame,
+    name_col: str = "Name",
+    threshold: float = 0.6,
+) -> Optional[Tuple[pd.Series, float]]:
+    """
+    Find the best fuzzy match for *client_name* among rows in *customers_df*.
+
+    Returns (customer_row, score) if the best match exceeds *threshold*,
+    otherwise None.
+    """
+    if name_col not in customers_df.columns:
+        return None
+
+    norm_query = _normalize_name(client_name)
+    if not norm_query:
+        return None
+
+    best_score = 0.0
+    best_idx = None
+
+    for idx, cust_name in customers_df[name_col].items():
+        if not isinstance(cust_name, str):
+            continue
+        norm_cust = _normalize_name(cust_name)
+        if not norm_cust:
+            continue
+
+        if norm_query == norm_cust:
+            return customers_df.loc[idx], 1.0
+
+        if norm_query in norm_cust or norm_cust in norm_query:
+            score = max(0.85, SequenceMatcher(None, norm_query, norm_cust).ratio())
+        else:
+            score = SequenceMatcher(None, norm_query, norm_cust).ratio()
+
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_idx is not None and best_score >= threshold:
+        return customers_df.loc[best_idx], best_score
+    return None
+
+
+def map_billing_files_to_customers(
+    billing_entries: List[Tuple[str, pd.DataFrame]],
+    all_customers_df: pd.DataFrame,
+    fuzzy_match: bool = False,
+    fuzzy_threshold: float = 0.6,
+) -> List[Dict]:
+    """
+    Map billing file DataFrames to their Tabs customer IDs.
+
+    Each returned dict has keys:
+        customer_id, client_id, filename, df, match_type, client_name,
+        tabs_customer_name, match_score.
+
+    *match_type* is ``"client_id"`` for exact Client-ID matches or
+    ``"fuzzy"`` for name-based fuzzy matches (only attempted when
+    *fuzzy_match* is True).
+    """
+    all_customers_df = _standardize_customer_columns(all_customers_df)
+
+    missing = [c for c in ("Client ID", "Customer ID") if c not in all_customers_df.columns]
+    if missing:
+        raise ValueError(
+            f"Customer mapping missing column(s): {', '.join(missing)}. "
+            f"Detected: {list(all_customers_df.columns)}"
+        )
+
+    name_col = "Name" if "Name" in all_customers_df.columns else None
+
+    results: List[Dict] = []
+    for filename, billing_df in billing_entries:
+        if billing_df is None or billing_df.empty:
+            continue
+        if "Client ID" not in billing_df.columns:
+            continue
+
+        client_id = billing_df.iloc[0]["Client ID"]
+        try:
+            client_id = int(client_id)
+        except Exception:
+            if "Clinic(s)" in billing_df.columns:
+                client_id = billing_df.iloc[0]["Clinic(s)"]
+
+        client_name = str(billing_df.iloc[0].get("Client Name", "")) if "Client Name" in billing_df.columns else ""
+
+        # --- exact Client-ID match ---
+        customer_row = all_customers_df[all_customers_df["Client ID"] == client_id]
+        if not customer_row.empty:
+            row = customer_row.iloc[0]
+            results.append({
+                "customer_id": str(row["Customer ID"]),
+                "client_id": client_id,
+                "client_name": client_name,
+                "tabs_customer_name": str(row.get("Name", "")),
+                "filename": filename,
+                "df": billing_df,
+                "match_type": "client_id",
+                "match_score": 1.0,
+            })
+            continue
+
+        # --- fuzzy name fallback ---
+        if fuzzy_match and client_name and name_col:
+            result = _fuzzy_find_customer(
+                client_name, all_customers_df, name_col=name_col, threshold=fuzzy_threshold
+            )
+            if result is not None:
+                row, score = result
+                results.append({
+                    "customer_id": str(row["Customer ID"]),
+                    "client_id": client_id,
+                    "client_name": client_name,
+                    "tabs_customer_name": str(row.get("Name", "")),
+                    "filename": filename,
+                    "df": billing_df,
+                    "match_type": "fuzzy",
+                    "match_score": round(score, 3),
+                })
+
+    return results
 
 
 def chunk_csv_bytes(

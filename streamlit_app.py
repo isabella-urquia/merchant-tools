@@ -5,7 +5,8 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from dosespot_processing import compute_usage, chunk_csv_bytes
+from dosespot_processing import compute_usage, chunk_csv_bytes, map_billing_files_to_customers
+from tabs_api import TabsClient, bulk_attach_billing_to_invoices
 
 
 st.set_page_config(page_title="Dosespot Usage Uploader", page_icon="💊", layout="wide")
@@ -33,8 +34,9 @@ def read_uploaded_excel(file) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def read_billing_zip(file) -> list[pd.DataFrame]:
-    dfs: list[pd.DataFrame] = []
+def read_billing_zip(file) -> list[tuple[str, pd.DataFrame]]:
+    """Read CSVs from a ZIP, returning (filename, DataFrame) pairs."""
+    entries: list[tuple[str, pd.DataFrame]] = []
     try:
         with zipfile.ZipFile(file) as zf:
             for name in zf.namelist():
@@ -46,12 +48,12 @@ def read_billing_zip(file) -> list[pd.DataFrame]:
                         except Exception:
                             df = pd.read_csv(io.BytesIO(data), lineterminator='\r')
                         if not df.empty:
-                            dfs.append(df)
+                            entries.append((name, df))
                     except Exception as e:
                         st.warning(f"Could not read {name} from ZIP: {e}")
     except Exception as e:
         st.error(f"Failed to open ZIP: {e}")
-    return dfs
+    return entries
 
 
 st.title("Dosespot Usage Upload")
@@ -86,9 +88,11 @@ if generate_clicked:
         st.warning("Please upload all required files.")
     else:
         with st.spinner("Processing..."):
-            billing_dfs = read_billing_zip(billing_zip)
+            billing_entries = read_billing_zip(billing_zip)
             idp_df = read_uploaded_excel(idp_file)
             customers_df = read_uploaded_csv(customers_file)
+
+            billing_dfs = [df for _, df in billing_entries]
 
             try:
                 output_df = compute_usage(
@@ -101,15 +105,15 @@ if generate_clicked:
                 st.error(f"Failed to compute usage: {e}")
                 output_df = pd.DataFrame()
 
-            # Save results in session to persist across reruns
             st.session_state["usage_output_df"] = output_df
             st.session_state["usage_filename_base"] = f"output-{selected_date.strftime('%Y%m%d')}"
-            # Precompute chunks for faster subsequent reruns
             st.session_state["usage_chunks"] = chunk_csv_bytes(
                 output_df=output_df,
                 base_output_filename=st.session_state["usage_filename_base"],
                 chunk_size=500,
             )
+            st.session_state["billing_entries"] = billing_entries
+            st.session_state["customers_df"] = customers_df
 
 # Render last generated results if available
 output_df_state = st.session_state.get("usage_output_df")
@@ -133,4 +137,140 @@ if isinstance(output_df_state, pd.DataFrame):
         else:
             st.info("No non-empty chunks to download.")
 
+st.divider()
 
+# ── Bulk Attach Billing Files to Invoices ─────────────────────────────────────
+st.subheader("Bulk Attach Billing Files to Invoices")
+st.caption(
+    "After generating usage, attach the original billing CSVs to matching "
+    "Tabs invoices. Requires a Tabs API URL and key."
+)
+
+with st.expander("Tabs API Connection", expanded=False):
+    tabs_url = st.text_input("Tabs Base URL", placeholder="https://api.tabsplatform.com")
+    tabs_key = st.text_input("Tabs API Key", type="password")
+
+billing_entries_state = st.session_state.get("billing_entries", [])
+customers_df_state = st.session_state.get("customers_df")
+
+attach_ready = (
+    bool(tabs_url)
+    and bool(tabs_key)
+    and len(billing_entries_state) > 0
+    and customers_df_state is not None
+)
+
+# Step 1 — Preview matches (including fuzzy)
+preview_clicked = st.button(
+    "Preview Matches",
+    type="secondary",
+    disabled=not attach_ready,
+    help="Generate usage first, then provide Tabs credentials above.",
+)
+
+if preview_clicked:
+    try:
+        mapped = map_billing_files_to_customers(
+            billing_entries_state, customers_df_state, fuzzy_match=True
+        )
+    except Exception as e:
+        st.error(f"Mapping failed: {e}")
+        mapped = []
+    st.session_state["mapped_entries"] = mapped
+
+mapped_state = st.session_state.get("mapped_entries", [])
+
+if mapped_state:
+    exact = [e for e in mapped_state if e.get("match_type") == "client_id"]
+    fuzzy = [e for e in mapped_state if e.get("match_type") == "fuzzy"]
+
+    st.markdown(f"**{len(exact)}** matched by Client ID, **{len(fuzzy)}** fuzzy-matched by name")
+
+    if fuzzy:
+        st.subheader("Fuzzy Matches — Review Before Attaching")
+        st.caption(
+            "These billing files didn't match by Client ID. The best name match "
+            "is shown below. Uncheck any incorrect matches. Confirmed matches "
+            "will have the Client ID custom field set on the Tabs customer."
+        )
+        fuzzy_review = pd.DataFrame([
+            {
+                "Billing Client Name": e["client_name"],
+                "Tabs Customer Name": e["tabs_customer_name"],
+                "Score": e["match_score"],
+                "Client ID": e["client_id"],
+                "Filename": e["filename"],
+            }
+            for e in fuzzy
+        ])
+        edited_review = st.data_editor(
+            fuzzy_review,
+            column_config={"_select": st.column_config.CheckboxColumn("Include", default=True)},
+            disabled=["Billing Client Name", "Tabs Customer Name", "Score", "Client ID", "Filename"],
+            num_rows="fixed",
+            use_container_width=True,
+            key="fuzzy_review_editor",
+        )
+
+    # Step 2 — Run bulk attach
+    attach_clicked = st.button("Bulk Attach to Invoices", type="primary")
+
+    if attach_clicked:
+        client = TabsClient(base_url=tabs_url, api_key=tabs_key)
+        date_str = selected_date.strftime("%Y-%m-%d")
+
+        # Resolve Client ID custom field for backfill
+        client_id_field_id = None
+        if fuzzy:
+            with st.spinner("Looking up Client ID custom field…"):
+                client_id_field_id = client.resolve_client_id_field()
+            if not client_id_field_id:
+                st.warning("Could not find a 'Client ID' custom field — fuzzy matches will attach but won't backfill the field.")
+
+        # Filter out rejected fuzzy matches
+        if fuzzy and "fuzzy_review_editor" in st.session_state:
+            editor_state = st.session_state["fuzzy_review_editor"]
+            deleted_rows = {r for r in editor_state.get("deleted_rows", [])}
+            approved_fuzzy_filenames = {
+                fuzzy_review.iloc[i]["Filename"]
+                for i in range(len(fuzzy_review))
+                if i not in deleted_rows
+            }
+            final_entries = [
+                e for e in mapped_state
+                if e["match_type"] == "client_id"
+                or e["filename"] in approved_fuzzy_filenames
+            ]
+        else:
+            final_entries = mapped_state
+
+        if not final_entries:
+            st.warning("No billing files to attach.")
+        else:
+            progress = st.progress(0, text="Attaching…")
+
+            def _update_progress(idx: int, total: int, fname: str):
+                progress.progress((idx + 1) / total, text=f"({idx + 1}/{total}) {fname}")
+
+            results = bulk_attach_billing_to_invoices(
+                client=client,
+                mapped_entries=final_entries,
+                issue_date=date_str,
+                client_id_field_id=client_id_field_id,
+                progress_callback=_update_progress,
+            )
+            progress.empty()
+
+            results_df = pd.DataFrame(results)
+            attached = results_df[results_df["status"] == "attached"]
+            skipped = results_df[results_df["status"] == "skipped"]
+            errored = results_df[results_df["status"] == "error"]
+            backfilled = results_df[results_df.get("client_id_set", False) == True] if "client_id_set" in results_df.columns else pd.DataFrame()
+
+            summary = f"Done — {len(attached)} attached, {len(skipped)} skipped, {len(errored)} errors"
+            if not backfilled.empty:
+                summary += f", {len(backfilled)} Client IDs set"
+            st.success(f"{summary}.")
+            if not results_df.empty:
+                display_cols = [c for c in results_df.columns if c != "df"]
+                st.dataframe(results_df[display_cols], use_container_width=True)
