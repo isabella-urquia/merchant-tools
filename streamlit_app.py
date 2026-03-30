@@ -226,8 +226,39 @@ if mapped_state:
                 use_container_width=True,
             )
 
-    # Step 2 — Run bulk attach
-    attach_clicked = st.button("Bulk Attach to Invoices", type="primary")
+    # Step 2 — Dry run or full attach
+    col_dry, col_attach = st.columns(2)
+    with col_dry:
+        dry_run_clicked = st.button("Dry Run (1 file)", type="secondary")
+    with col_attach:
+        attach_clicked = st.button("Bulk Attach to Invoices", type="primary")
+
+    if dry_run_clicked:
+        client = TabsClient(base_url=tabs_url, api_key=tabs_key)
+        date_str = selected_date.strftime("%Y-%m-%d")
+
+        first_matched = next(
+            (e for e in mapped_state if e["match_type"] in ("client_id", "fuzzy")), None
+        )
+        if not first_matched:
+            st.warning("No matched billing files to test.")
+        else:
+            st.markdown(f"**Testing:** `{first_matched['filename']}`")
+            st.markdown(f"Customer: **{first_matched.get('tabs_customer_name', '')}** (`{first_matched['customer_id']}`)")
+
+            invoices = client.get_invoices(
+                customer_id=first_matched["customer_id"],
+                issue_date=date_str,
+            )
+
+            if not invoices:
+                st.error(f"No invoice found for customer `{first_matched['customer_id']}` on {date_str}")
+            else:
+                inv = invoices[0]
+                st.success(f"Found invoice `{inv.get('id')}` — status: {inv.get('status', 'N/A')}, amount: {inv.get('total', 'N/A')}")
+                st.caption("This is a dry run — no file was attached.")
+                with st.expander("Invoice details"):
+                    st.json({k: v for k, v in inv.items() if k != "lineItems"})
 
     if attach_clicked:
         client = TabsClient(base_url=tabs_url, api_key=tabs_key)
