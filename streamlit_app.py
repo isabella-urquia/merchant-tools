@@ -255,12 +255,33 @@ if invoice_mapping_state:
                 use_container_width=True,
             )
 
-    # Step 2 — Bulk attach
-    attach_clicked = st.button(
-        f"Bulk Attach {len(ready)} Files to Invoices",
-        type="primary",
-        disabled=len(ready) == 0,
-    )
+    # Step 2 — Test one or bulk attach
+    col_test, col_attach = st.columns(2)
+    with col_test:
+        test_clicked = st.button("Test Attach (1 file)", type="secondary", disabled=len(ready) == 0)
+    with col_attach:
+        attach_clicked = st.button(
+            f"Bulk Attach {len(ready)} Files to Invoices",
+            type="primary",
+            disabled=len(ready) == 0,
+        )
+
+    if test_clicked:
+        client = TabsClient(base_url=tabs_url, api_key=tabs_key)
+        first_ready = next(r for r in invoice_mapping_state if r["mapping_status"] == "Ready")
+        first_entry = next(e for e in mapped_state if e["filename"] == first_ready["filename"])
+
+        st.markdown(f"**Testing:** `{first_ready['filename']}`")
+        st.markdown(
+            f"Customer: **{first_ready['tabs_customer_name']}** → "
+            f"Invoice: `{first_ready['invoice_id']}` ({first_ready['invoice_status']})"
+        )
+
+        try:
+            client.put_attachment(first_ready["invoice_id"], first_entry["df"], first_entry["filename"])
+            st.success("Attachment succeeded — file was uploaded to the invoice.")
+        except Exception as e:
+            st.error(f"Attachment failed: {e}")
 
     if attach_clicked:
         client = TabsClient(base_url=tabs_url, api_key=tabs_key)
