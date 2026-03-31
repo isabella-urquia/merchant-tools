@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from dosespot_processing import compute_usage, chunk_csv_bytes, map_billing_files_to_customers
-from tabs_api import TabsClient, bulk_attach_billing_to_invoices
+from tabs_api import TabsClient, bulk_attach_billing_to_invoices, build_invoice_mapping
 
 
 st.set_page_config(page_title="Dosespot Usage Uploader", page_icon="💊", layout="wide")
@@ -158,43 +158,72 @@ attach_ready = (
     and customers_df_state is not None
 )
 
-# Step 1 — Preview matches (including fuzzy)
-preview_clicked = st.button(
-    "Preview Matches",
+# Step 1 — Invoice Mapping (one API call)
+map_clicked = st.button(
+    "Map Invoices",
     type="secondary",
     disabled=not attach_ready,
-    help="Generate usage first, then provide Tabs credentials above.",
+    help="Generate usage first, then provide Tabs API key above.",
 )
 
-if preview_clicked:
+if map_clicked:
+    client = TabsClient(base_url=tabs_url, api_key=tabs_key)
+    date_str = selected_date.strftime("%Y-%m-%d")
+
     try:
         mapped = map_billing_files_to_customers(
             billing_entries_state, customers_df_state, fuzzy_match=True
         )
     except Exception as e:
-        st.error(f"Mapping failed: {e}")
+        st.error(f"Customer mapping failed: {e}")
         mapped = []
-    st.session_state["mapped_entries"] = mapped
+
+    if mapped:
+        with st.spinner(f"Fetching invoices for {date_str}…"):
+            invoices_cache = client.fetch_all_invoices_by_date(date_str)
+
+        invoice_mapping = build_invoice_mapping(mapped, invoices_cache, date_str)
+        st.session_state["mapped_entries"] = mapped
+        st.session_state["invoices_cache"] = invoices_cache
+        st.session_state["invoice_mapping"] = invoice_mapping
 
 mapped_state = st.session_state.get("mapped_entries", [])
+invoice_mapping_state = st.session_state.get("invoice_mapping", [])
 
-if mapped_state:
-    exact = [e for e in mapped_state if e.get("match_type") == "client_id"]
+if invoice_mapping_state:
+    ready = [r for r in invoice_mapping_state if r["mapping_status"] == "Ready"]
+    no_invoice = [r for r in invoice_mapping_state if r["mapping_status"] == "No invoice found"]
+    no_customer = [r for r in invoice_mapping_state if r["mapping_status"] == "No customer match"]
     fuzzy = [e for e in mapped_state if e.get("match_type") == "fuzzy"]
-    unmatched = [e for e in mapped_state if e.get("match_type") == "unmatched"]
 
     st.markdown(
-        f"**{len(exact)}** matched by Client ID, "
-        f"**{len(fuzzy)}** fuzzy-matched by name, "
-        f"**{len(unmatched)}** unmatched"
+        f"**{len(ready)}** ready to attach, "
+        f"**{len(no_invoice)}** no invoice found, "
+        f"**{len(no_customer)}** no customer match"
     )
 
+    # Invoice mapping table
+    st.subheader("Invoice Mapping")
+    mapping_display = pd.DataFrame([
+        {
+            "Filename": r["filename"],
+            "Client Name": r["client_name"],
+            "Customer Name": r["tabs_customer_name"],
+            "Invoice ID": r["invoice_id"] or "—",
+            "Invoice Status": r["invoice_status"] or "—",
+            "Match Type": r["match_type"],
+            "Status": r["mapping_status"],
+        }
+        for r in invoice_mapping_state
+        if r["mapping_status"] != "No customer match"
+    ])
+    st.dataframe(mapping_display, use_container_width=True)
+
     if fuzzy:
-        st.subheader("Fuzzy Matches — Review Before Attaching")
+        st.subheader("Fuzzy Matches — Review")
         st.caption(
-            "These billing files didn't match by Client ID. The best name match "
-            "is shown below. Uncheck any incorrect matches. Confirmed matches "
-            "will have the Client ID custom field set on the Tabs customer."
+            "These billing files matched by name, not Client ID. "
+            "Confirmed matches will have the Client ID custom field set on the Tabs customer."
         )
         fuzzy_review = pd.DataFrame([
             {
@@ -206,7 +235,7 @@ if mapped_state:
             }
             for e in fuzzy
         ])
-        edited_review = st.data_editor(
+        st.data_editor(
             fuzzy_review,
             column_config={"_select": st.column_config.CheckboxColumn("Include", default=True)},
             disabled=["Billing Client Name", "Tabs Customer Name", "Score", "Client ID", "Filename"],
@@ -215,54 +244,26 @@ if mapped_state:
             key="fuzzy_review_editor",
         )
 
-    if unmatched:
-        with st.expander(f"Unmatched Files ({len(unmatched)})", expanded=False):
-            st.caption("These billing files could not be matched to any Tabs customer by Client ID or name.")
+    if no_customer:
+        with st.expander(f"Unmatched Files ({len(no_customer)})", expanded=False):
+            st.caption("These billing files could not be matched to any Tabs customer.")
             st.dataframe(
                 pd.DataFrame([
-                    {"Client Name": e["client_name"], "Client ID": e["client_id"], "Filename": e["filename"]}
-                    for e in unmatched
+                    {"Client Name": r["client_name"], "Client ID": r["client_id"], "Filename": r["filename"]}
+                    for r in no_customer
                 ]),
                 use_container_width=True,
             )
 
-    # Step 2 — Dry run or full attach
-    col_dry, col_attach = st.columns(2)
-    with col_dry:
-        dry_run_clicked = st.button("Dry Run (1 file)", type="secondary")
-    with col_attach:
-        attach_clicked = st.button("Bulk Attach to Invoices", type="primary")
-
-    if dry_run_clicked:
-        client = TabsClient(base_url=tabs_url, api_key=tabs_key)
-        date_str = selected_date.strftime("%Y-%m-%d")
-
-        first_matched = next(
-            (e for e in mapped_state if e["match_type"] in ("client_id", "fuzzy")), None
-        )
-        if not first_matched:
-            st.warning("No matched billing files to test.")
-        else:
-            st.markdown(f"**Testing:** `{first_matched['filename']}`")
-            st.markdown(f"Customer: **{first_matched.get('tabs_customer_name', '')}** (`{first_matched['customer_id']}`)")
-
-            invoices = client.get_invoices(
-                customer_id=first_matched["customer_id"],
-                issue_date=date_str,
-            )
-
-            if not invoices:
-                st.error(f"No invoice found for customer `{first_matched['customer_id']}` on {date_str}")
-            else:
-                inv = invoices[0]
-                st.success(f"Found invoice `{inv.get('id')}` — status: {inv.get('status', 'N/A')}, amount: {inv.get('total', 'N/A')}")
-                st.caption("This is a dry run — no file was attached.")
-                with st.expander("Invoice details"):
-                    st.json({k: v for k, v in inv.items() if k != "lineItems"})
+    # Step 2 — Bulk attach
+    attach_clicked = st.button(
+        f"Bulk Attach {len(ready)} Files to Invoices",
+        type="primary",
+        disabled=len(ready) == 0,
+    )
 
     if attach_clicked:
         client = TabsClient(base_url=tabs_url, api_key=tabs_key)
-        date_str = selected_date.strftime("%Y-%m-%d")
 
         # Resolve Client ID custom field for backfill
         client_id_field_id = None
@@ -286,10 +287,18 @@ if mapped_state:
                 if e["match_type"] == "client_id"
                 or (e["match_type"] == "fuzzy" and e["filename"] in approved_fuzzy_filenames)
             ]
+            final_mapping = [
+                r for r in invoice_mapping_state
+                if r["mapping_status"] == "Ready" and (
+                    r["match_type"] == "client_id"
+                    or r["filename"] in approved_fuzzy_filenames
+                )
+            ]
         else:
             final_entries = [e for e in mapped_state if e["match_type"] != "unmatched"]
+            final_mapping = [r for r in invoice_mapping_state if r["mapping_status"] == "Ready"]
 
-        if not final_entries:
+        if not final_mapping:
             st.warning("No billing files to attach.")
         else:
             progress = st.progress(0, text="Attaching…")
@@ -300,7 +309,7 @@ if mapped_state:
             results = bulk_attach_billing_to_invoices(
                 client=client,
                 mapped_entries=final_entries,
-                issue_date=date_str,
+                invoice_mapping=final_mapping,
                 client_id_field_id=client_id_field_id,
                 progress_callback=_update_progress,
             )
@@ -308,11 +317,10 @@ if mapped_state:
 
             results_df = pd.DataFrame(results)
             attached = results_df[results_df["status"] == "attached"]
-            skipped = results_df[results_df["status"] == "skipped"]
             errored = results_df[results_df["status"] == "error"]
             backfilled = results_df[results_df.get("client_id_set", False) == True] if "client_id_set" in results_df.columns else pd.DataFrame()
 
-            summary = f"Done — {len(attached)} attached, {len(skipped)} skipped, {len(errored)} errors"
+            summary = f"Done — {len(attached)} attached, {len(errored)} errors"
             if not backfilled.empty:
                 summary += f", {len(backfilled)} Client IDs set"
             st.success(f"{summary}.")

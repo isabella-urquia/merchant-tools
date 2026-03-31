@@ -33,7 +33,7 @@ class TabsClient:
         status: str = None,
         limit: int = 1000,
     ) -> List[dict]:
-        """Fetch invoices with optional filters (mirrors nos get_invoices / bridge-alpha get_invoices_by_filter)."""
+        """Fetch invoices with optional filters."""
         filters: list[str] = []
         if customer_id:
             filters.append(f'customerId:eq:"{customer_id}"')
@@ -55,6 +55,29 @@ class TabsClient:
         if isinstance(payload, list):
             return payload
         return payload.get("data", [])
+
+    def fetch_all_invoices_by_date(self, issue_date: str, limit: int = 1000) -> List[dict]:
+        """Fetch ALL invoices for a given issue date in one paginated pass."""
+        all_invoices: List[dict] = []
+        page = 1
+        while True:
+            params = {
+                "filter": f'issueDate:eq:"{issue_date}"',
+                "limit": limit,
+                "page": page,
+            }
+            response = self._request("GET", "/v3/invoices", params=params)
+            result = response.json()
+            payload = result.get("payload", {})
+            data = payload.get("data", [])
+            if not data:
+                break
+            all_invoices.extend(data)
+            total_items = payload.get("totalItems", 0)
+            if len(all_invoices) >= total_items:
+                break
+            page += 1
+        return all_invoices
 
     def get_custom_fields(self) -> List[dict]:
         """Fetch all merchant custom fields (GET /v3/custom-fields)."""
@@ -127,47 +150,96 @@ class TabsClient:
         return result
 
 
+def _find_invoice_for_customer(customer_id: str, issue_date: str, invoices_cache: List[Dict]) -> Optional[Dict]:
+    """Find the first invoice matching a customer ID from the cached list."""
+    for inv in invoices_cache:
+        inv_date = inv.get("issueDate", "")[:10]
+        if inv.get("customerId") == customer_id and inv_date == issue_date:
+            return inv
+    return None
+
+
+def build_invoice_mapping(
+    mapped_entries: List[Dict],
+    invoices_cache: List[Dict],
+    issue_date: str,
+) -> List[Dict]:
+    """
+    Build a mapping table: billing file -> customer -> invoice.
+
+    Uses the pre-fetched *invoices_cache* (from a single API call) so no
+    per-customer requests are needed.
+
+    Returns a list of dicts with keys:
+        filename, client_name, tabs_customer_name, customer_id, client_id,
+        match_type, invoice_id, invoice_status, mapping_status.
+    """
+    results: List[Dict] = []
+    for entry in mapped_entries:
+        base = {
+            "filename": entry["filename"],
+            "client_name": entry.get("client_name", ""),
+            "tabs_customer_name": entry.get("tabs_customer_name", ""),
+            "customer_id": entry.get("customer_id"),
+            "client_id": entry.get("client_id"),
+            "match_type": entry.get("match_type", "client_id"),
+        }
+
+        if entry.get("match_type") == "unmatched":
+            results.append({**base, "invoice_id": None, "invoice_status": None, "mapping_status": "No customer match"})
+            continue
+
+        inv = _find_invoice_for_customer(entry["customer_id"], issue_date, invoices_cache)
+        if inv:
+            results.append({
+                **base,
+                "invoice_id": inv.get("id"),
+                "invoice_status": inv.get("status"),
+                "mapping_status": "Ready",
+            })
+        else:
+            results.append({**base, "invoice_id": None, "invoice_status": None, "mapping_status": "No invoice found"})
+
+    return results
+
+
 def bulk_attach_billing_to_invoices(
     client: TabsClient,
     mapped_entries: List[Dict],
-    issue_date: str,
+    invoice_mapping: List[Dict],
     client_id_field_id: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict]:
     """
-    Bulk-attach billing CSV files to their corresponding Tabs invoices.
+    Bulk-attach billing CSV files using a pre-built invoice mapping.
 
-    For entries that were fuzzy-matched (``match_type == "fuzzy"``), the
-    Client ID custom field is set on the customer before attaching — if
+    Only entries with ``mapping_status == "Ready"`` are processed.
+    Fuzzy-matched entries get the Client ID custom field backfilled when
     *client_id_field_id* is provided.
-
-    Args:
-        client: Authenticated TabsClient instance.
-        mapped_entries: Output of dosespot_processing.map_billing_files_to_customers.
-        issue_date: Invoice issue date (YYYY-MM-DD) used to locate the target invoice.
-        client_id_field_id: The manufacturerCustomFieldId for the "Client ID" custom
-                            field.  When provided, fuzzy-matched entries will have the
-                            field set on the customer automatically.
-        progress_callback: Optional (current_index, total, filename) callback.
-
-    Returns:
-        List of result dicts per entry.
     """
+    invoice_lookup = {row["filename"]: row for row in invoice_mapping if row["mapping_status"] == "Ready"}
+    entries_by_filename = {e["filename"]: e for e in mapped_entries}
+
     results: List[Dict] = []
 
-    for i, entry in enumerate(mapped_entries):
+    attachable = [f for f in invoice_lookup]
+    for i, filename in enumerate(attachable):
         if progress_callback:
-            progress_callback(i, len(mapped_entries), entry["filename"])
+            progress_callback(i, len(attachable), filename)
+
+        mapping_row = invoice_lookup[filename]
+        entry = entries_by_filename[filename]
+        invoice_id = mapping_row["invoice_id"]
 
         base = {
-            "filename": entry["filename"],
-            "customer_id": entry["customer_id"],
-            "client_id": entry["client_id"],
-            "match_type": entry.get("match_type", "client_id"),
+            "filename": filename,
+            "customer_id": mapping_row["customer_id"],
+            "client_id": mapping_row["client_id"],
+            "match_type": mapping_row["match_type"],
+            "invoice_id": invoice_id,
         }
 
         try:
-            # Backfill Client ID custom field for fuzzy-matched customers
             if entry.get("match_type") == "fuzzy" and client_id_field_id:
                 existing = client.get_customer_custom_field_value(
                     entry["customer_id"], field_id=client_id_field_id
@@ -178,20 +250,10 @@ def bulk_attach_billing_to_invoices(
                     )
                     base["client_id_set"] = True
 
-            invoices = client.get_invoices(
-                customer_id=entry["customer_id"],
-                issue_date=issue_date,
-            )
-
-            if not invoices:
-                results.append({**base, "invoice_id": None, "status": "skipped", "message": "No invoice found"})
-                continue
-
-            invoice_id = invoices[0].get("id")
-            client.put_attachment(invoice_id, entry["df"], entry["filename"])
-            results.append({**base, "invoice_id": invoice_id, "status": "attached", "message": "Success"})
+            client.put_attachment(invoice_id, entry["df"], filename)
+            results.append({**base, "status": "attached", "message": "Success"})
 
         except Exception as e:
-            results.append({**base, "invoice_id": None, "status": "error", "message": str(e)})
+            results.append({**base, "status": "error", "message": str(e)})
 
     return results
